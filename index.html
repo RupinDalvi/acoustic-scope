@@ -1,0 +1,516 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+// Acoustic Scout – a near-finished prototype web app that:
+// 1) Listens for ambient audio using the phone's microphones
+// 2) Heuristically classifies events (voice, footsteps, animal call, twig snap, unknown)
+// 3) Estimates LEFT/RIGHT bearing using stereo interaural time difference (ITD)
+// 4) Plots rough source markers on a forward arc relative to the phone orientation
+//
+// Notes:
+// - For best results, disable system noise suppression and hold the phone so its screen faces you, camera-end forward.
+// - Direction works best when the device exposes 2 channels (stereo). If only mono is available, you still get classification with no direction.
+// - You can optionally enable the device compass to align the arc with world heading (needs user permission on some devices).
+// - This is a browser-only prototype; accuracy depends heavily on hardware, environment, and OS audio processing.
+
+export default function AcousticScout() {
+  // UI state
+  const [running, setRunning] = useState(false);
+  const [hasStereo, setHasStereo] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [compassEnabled, setCompassEnabled] = useState(false);
+  const [headingDeg, setHeadingDeg] = useState<number | null>(null); // 0=N
+
+  // detections store
+  type Detection = {
+    id: string;
+    t: number; // epoch ms
+    label: "voice" | "footsteps" | "animal_call" | "twig_snap" | "unknown";
+    confidence: number; // 0..1
+    angleDeg: number | null; // -90 (left) .. +90 (right) relative to phone forward
+    distanceBand: "near" | "mid" | "far"; // rough, from energy
+  };
+  const [detections, setDetections] = useState<Detection[]>([]);
+
+  // Web Audio graph refs
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const mediaStreamRef = useRef<MediaStream | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const scriptRef = useRef<ScriptProcessorNode | null>(null);
+  const gainRef = useRef<GainNode | null>(null);
+
+  // Rolling buffers for feature logic
+  const lastOnsetsRef = useRef<number[]>([]); // ms timestamps of detected onsets
+  const energyEMARef = useRef<number>(0);
+
+  // Constants / Tunables
+  const SPEED_OF_SOUND = 343; // m/s
+  const MIC_SEPARATION_M = 0.08; // 8 cm typical phone mic spacing (assumption)
+  const MAX_TDOA_S = MIC_SEPARATION_M / SPEED_OF_SOUND; // ~0.23 ms
+  const MAX_LAG_SAMPLES_AT_48K = Math.ceil(48000 * MAX_TDOA_S) + 2; // ~13 samples
+
+  // Utility: clamp
+  const clamp = (x: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, x));
+
+  // Utility: simple ID
+  const uid = () => Math.random().toString(36).slice(2, 10);
+
+  // Direction estimation via short-window cross-correlation
+  function estimateAngleDegFromStereo(left: Float32Array, right: Float32Array, sampleRate: number) {
+    const N = Math.min(left.length, right.length);
+    if (N < 256) return null;
+
+    // Search limited lag around expected max TDOA
+    const maxLag = Math.min(Math.ceil(sampleRate * MAX_TDOA_S) + 2, 24);
+    let bestLag = 0;
+    let bestScore = -Infinity;
+
+    // Normalize windows (energy) to reduce level effects
+    let lNorm = 0, rNorm = 0;
+    for (let i = 0; i < N; i++) { lNorm += left[i] * left[i]; rNorm += right[i] * right[i]; }
+    lNorm = Math.sqrt(lNorm / N) + 1e-9;
+    rNorm = Math.sqrt(rNorm / N) + 1e-9;
+
+    for (let lag = -maxLag; lag <= maxLag; lag++) {
+      let sum = 0;
+      if (lag >= 0) {
+        for (let i = 0; i < N - lag; i++) sum += (left[i] / lNorm) * (right[i + lag] / rNorm);
+      } else {
+        const k = -lag;
+        for (let i = 0; i < N - k; i++) sum += (left[i + k] / lNorm) * (right[i] / rNorm);
+      }
+      if (sum > bestScore) { bestScore = sum; bestLag = lag; }
+    }
+
+    const tdoa = bestLag / sampleRate; // seconds
+    const sinTheta = clamp((tdoa * SPEED_OF_SOUND) / MIC_SEPARATION_M, -1, 1);
+    const thetaRad = Math.asin(sinTheta);
+    const thetaDeg = (thetaRad * 180) / Math.PI;
+
+    // thetaDeg > 0 means sound arrived earlier at LEFT or RIGHT depending on device mic order.
+    // We assume channel 0 ~ left, channel 1 ~ right. If your device flips, toggle SIGN below.
+    const SIGN = -1; // empirical: many phones expose ch0 as bottom/right mic; adjust if needed
+    const bearing = clamp(SIGN * thetaDeg, -90, 90);
+    return bearing;
+  }
+
+  // Feature extraction helper from AnalyserNode (mono)
+  function extractSpectrumFeatures(analyser: AnalyserNode, sampleRate: number) {
+    const bins = analyser.frequencyBinCount; // fftSize/2
+    const freqs = new Float32Array(bins);
+    analyser.getFloatFrequencyData(freqs); // in dBFS (negative)
+
+    // Convert to linear magnitude and derive bands
+    const mags = new Float32Array(bins);
+    let sumMag = 0;
+    for (let i = 0; i < bins; i++) {
+      // Convert dB to linear magnitude; cap floor to avoid 0
+      const mag = Math.pow(10, freqs[i] / 20);
+      mags[i] = mag;
+      sumMag += mag;
+    }
+    const binHz = sampleRate / (2 * bins);
+
+    let low = 0, mid = 0, high = 0;
+    let centroidNum = 0;
+    let peak = 0, peakIdx = 0;
+    for (let i = 0; i < bins; i++) {
+      const f = i * binHz;
+      const m = mags[i];
+      centroidNum += f * m;
+      if (f < 300) low += m; else if (f < 3000) mid += m; else high += m;
+      if (m > peak) { peak = m; peakIdx = i; }
+    }
+    const centroid = sumMag > 0 ? centroidNum / sumMag : 0;
+
+    // Tonality proxy: peak-to-median ratio
+    const sorted = Array.from(mags).sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length * 0.5)] + 1e-9;
+    const tonality = peak / median; // > ~5 indicates strong tonal component (birdsong, whistle)
+
+    return { low, mid, high, centroid, tonality, total: sumMag, peakIdx, binHz };
+  }
+
+  // Heuristic classifier using spectral and temporal cues
+  function classifyEvent(features: ReturnType<typeof extractSpectrumFeatures>, onsetStrength: number) {
+    const { low, mid, high, centroid, tonality, total } = features;
+    const totalE = total + 1e-9;
+    const pLow = low / totalE, pMid = mid / totalE, pHigh = high / totalE;
+
+    // Confidence scaffold (0..1)
+    let label: Detection["label"] = "unknown";
+    let conf = 0.3;
+
+    // Speech: mid-band dominant, centroid ~ 500–2000 Hz, not too tonal
+    if (pMid > 0.45 && centroid > 400 && centroid < 2200 && tonality < 6) {
+      label = "voice";
+      conf = 0.55 + 0.25 * (pMid - 0.45) + 0.1 * (1 / Math.max(tonality, 1));
+    }
+
+    // Footsteps: repeated mid-low transients. Use onsetStrength + low-band share
+    const now = performance.now();
+    const onsets = lastOnsetsRef.current;
+    // compute inter-onset intervals (IOIs)
+    const ioi: number[] = [];
+    for (let i = 1; i < onsets.length; i++) ioi.push(onsets[i] - onsets[i - 1]);
+    const recentIOI = ioi.slice(-4);
+    const meanIOI = recentIOI.length ? recentIOI.reduce((a, b) => a + b, 0) / recentIOI.length : Infinity;
+    const ioiOK = meanIOI > 250 && meanIOI < 900; // 0.25–0.9 s cadence
+
+    if (onsetStrength > 0.6 && pLow > 0.35 && ioiOK) {
+      label = "footsteps";
+      conf = 0.5 + 0.2 * (pLow - 0.35) + 0.15 * Math.min(1, (0.9 - Math.abs(meanIOI - 600)) / 0.9);
+    }
+
+    // Animal call: high-band dominant and tonal
+    if (pHigh > 0.4 && tonality > 6 && centroid > 1500) {
+      label = "animal_call";
+      conf = 0.6 + 0.15 * (pHigh - 0.4) + 0.1 * Math.min(1, (tonality - 6) / 10);
+    }
+
+    // Twig snap: broadband sharp transient with high onset and decent high-band
+    if (onsetStrength > 0.75 && pHigh > 0.25 && pMid > 0.25) {
+      label = "twig_snap";
+      conf = 0.55 + 0.2 * (onsetStrength - 0.75);
+    }
+
+    conf = clamp(conf, 0.05, 0.99);
+    return { label, conf } as const;
+  }
+
+  // Distance band from energy envelope (very rough)
+  function distanceBandFromEnergy(energy: number): Detection["distanceBand"] {
+    if (energy > 0.25) return "near";
+    if (energy > 0.08) return "mid";
+    return "far";
+  }
+
+  // Compass handling (permission is required on iOS)
+  const enableCompass = useCallback(async () => {
+    try {
+      // iOS permission gate
+      const anyWindow: any = window as any;
+      if (typeof anyWindow.DeviceOrientationEvent !== "undefined" &&
+          typeof anyWindow.DeviceOrientationEvent.requestPermission === "function") {
+        const res = await anyWindow.DeviceOrientationEvent.requestPermission();
+        if (res !== "granted") throw new Error("Compass permission denied");
+      }
+      const handler = (ev: DeviceOrientationEvent) => {
+        // alpha: 0 deg when device points toward magnetic north
+        if (typeof ev.alpha === "number") setHeadingDeg((360 + (ev.alpha || 0)) % 360);
+      };
+      window.addEventListener("deviceorientation", handler, { passive: true });
+      setCompassEnabled(true);
+    } catch (e: any) {
+      setError(e?.message || String(e));
+    }
+  }, []);
+
+  // Start/Stop pipeline
+  const start = useCallback(async () => {
+    setError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 2,
+          sampleRate: 48000,
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+        video: false,
+      });
+      mediaStreamRef.current = stream;
+
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioCtxRef.current = ctx;
+
+      const source = ctx.createMediaStreamSource(stream);
+      sourceRef.current = source;
+
+      const gain = ctx.createGain();
+      gain.gain.value = 1.0; // analysis only
+      gainRef.current = gain;
+
+      // Analyser for spectrum
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048; // 1024 bins
+      analyser.smoothingTimeConstant = 0.8;
+      analyserRef.current = analyser;
+
+      // ScriptProcessor for stereo time-domain access
+      const script = ctx.createScriptProcessor(1024, 2, 2);
+      scriptRef.current = script;
+
+      source.connect(gain);
+      gain.connect(analyser);
+      gain.connect(script);
+      // do not connect to destination (no playback)
+
+      const sampleRate = ctx.sampleRate;
+      const maxLag = Math.min(Math.ceil(sampleRate * MAX_TDOA_S) + 2, 24);
+
+      setHasStereo(stream.getAudioTracks()[0]?.getSettings()?.channelCount === 2);
+
+      // Processing state
+      const freqFeatures = { low: 0, mid: 0, high: 0, centroid: 0, tonality: 0, total: 0 } as any;
+      const freqFrame = new Float32Array(analyser.frequencyBinCount);
+      const leftBuf = new Float32Array(1024);
+      const rightBuf = new Float32Array(1024);
+
+      // Onset detection variables
+      let prevEnergy = 0;
+
+      script.onaudioprocess = (e) => {
+        // Stereo buffers
+        const inBuf = e.inputBuffer;
+        const chs = inBuf.numberOfChannels;
+        const left = inBuf.getChannelData(0);
+        const right = chs > 1 ? inBuf.getChannelData(1) : inBuf.getChannelData(0);
+
+        // Copy small window (avoid mutation by engine)
+        leftBuf.set(left);
+        rightBuf.set(right);
+
+        // Energy & onset
+        let energy = 0;
+        for (let i = 0; i < leftBuf.length; i++) {
+          const m = 0.5 * (leftBuf[i] * leftBuf[i] + rightBuf[i] * rightBuf[i]);
+          energy += m;
+        }
+        energy /= leftBuf.length;
+        const ema = energyEMARef.current = 0.9 * (energyEMARef.current || energy) + 0.1 * energy;
+        const onsetStrength = Math.max(0, (energy - prevEnergy)) / (ema + 1e-6);
+        prevEnergy = energy;
+
+        // Track onsets (for rhythm patterns like footsteps)
+        if (onsetStrength > 0.65) {
+          const now = performance.now();
+          const arr = lastOnsetsRef.current;
+          arr.push(now);
+          while (arr.length > 12) arr.shift();
+        }
+
+        // Pull spectrum & features from analyser
+        analyser.getFloatFrequencyData(freqFrame);
+        // Convert to linear magnitude and compute bands/centroid/tonality
+        let low = 0, mid = 0, high = 0, centroidNum = 0, total = 0, peak = 0;
+        const bins = freqFrame.length;
+        const binHz = sampleRate / (2 * bins);
+        const mags = new Float32Array(bins);
+        for (let i = 0; i < bins; i++) {
+          const mag = Math.pow(10, freqFrame[i] / 20);
+          mags[i] = mag; total += mag; centroidNum += (i * binHz) * mag; if (mag > peak) peak = mag;
+          const f = i * binHz;
+          if (f < 300) low += mag; else if (f < 3000) mid += mag; else high += mag;
+        }
+        const sorted = Array.from(mags).sort((a, b) => a - b);
+        const median = sorted[Math.floor(sorted.length * 0.5)] + 1e-9;
+        const tonality = peak / median;
+        const centroid = total > 0 ? centroidNum / total : 0;
+        const features = { low, mid, high, centroid, tonality, total, binHz } as const;
+
+        // Classify
+        const { label, conf } = classifyEvent(features, onsetStrength);
+
+        // Direction (if stereo)
+        let angleDeg: number | null = null;
+        if (chs > 1) {
+          angleDeg = estimateAngleDegFromStereo(leftBuf, rightBuf, sampleRate);
+        }
+
+        // Only log concrete events with some confidence and energy
+        if (conf > 0.5 && energy > 0.0015) {
+          setDetections((prev) => {
+            const d: Detection = {
+              id: uid(),
+              t: Date.now(),
+              label,
+              confidence: conf,
+              angleDeg,
+              distanceBand: distanceBandFromEnergy(energy),
+            };
+            const next = [...prev, d].slice(-20); // keep last 20
+            return next;
+          });
+        }
+      };
+
+      script.connect(ctx.destination); // required in some browsers to "pull" processing; output muted below
+      // Immediately mute the script output path
+      const silence = ctx.createGain();
+      silence.gain.value = 0;
+      script.disconnect();
+      script.connect(silence);
+      silence.connect(ctx.destination);
+
+      setRunning(true);
+    } catch (e: any) {
+      console.error(e);
+      setError(e?.message || String(e));
+      stop();
+    }
+  }, []);
+
+  const stop = useCallback(() => {
+    try {
+      scriptRef.current?.disconnect();
+      analyserRef.current?.disconnect();
+      gainRef.current?.disconnect();
+      sourceRef.current?.disconnect();
+      audioCtxRef.current?.close();
+      mediaStreamRef.current?.getTracks().forEach((t) => t.stop());
+    } catch {}
+    audioCtxRef.current = null;
+    mediaStreamRef.current = null;
+    sourceRef.current = null;
+    analyserRef.current = null;
+    scriptRef.current = null;
+    gainRef.current = null;
+    setRunning(false);
+  }, []);
+
+  useEffect(() => () => stop(), [stop]);
+
+  // Simple smoothing/decay for plotted markers
+  const visibleDetections = useMemo(() => {
+    const cutoff = Date.now() - 8000; // show last 8s
+    return detections.filter((d) => d.t >= cutoff);
+  }, [detections]);
+
+  // UI helpers
+  function labelToText(l: Detection["label"]) {
+    switch (l) {
+      case "voice": return "Voice";
+      case "footsteps": return "Footsteps";
+      case "animal_call": return "Animal call";
+      case "twig_snap": return "Twig snap";
+      default: return "Unknown";
+    }
+  }
+
+  const ArcViz = () => {
+    // SVG forward arc (-90..+90 degrees)
+    const W = 340, H = 200;
+    const cx = W / 2, cy = H - 10;
+    const R = Math.min(cx, cy) - 6;
+    const toXY = (angleDeg: number, radiusPct: number) => {
+      const a = ((angleDeg - 90) * Math.PI) / 180; // map so 0deg forward is top center
+      const r = R * radiusPct;
+      return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
+    };
+
+    const ticks = [-90, -60, -30, 0, 30, 60, 90];
+
+    return (
+      <svg width={W} height={H} className="mx-auto block">
+        {/* arc */}
+        <path d={`M ${cx - R} ${cy} A ${R} ${R} 0 0 1 ${cx + R} ${cy}`} fill="none" stroke="#94a3b8" strokeWidth={2} />
+        {/* ticks & labels */}
+        {ticks.map((deg) => {
+          const p0 = toXY(deg, 1);
+          const p1 = toXY(deg, 0.9);
+          return (
+            <g key={deg}>
+              <line x1={p0.x} y1={p0.y} x2={p1.x} y2={p1.y} stroke="#94a3b8" strokeWidth={1} />
+              <text x={p1.x} y={p1.y - 4} fontSize={10} textAnchor="middle" fill="#64748b">{deg}°</text>
+            </g>
+          );
+        })}
+        {/* heading */}
+        {compassEnabled && headingDeg !== null && (
+          <text x={cx} y={18} textAnchor="middle" fontSize={12} fill="#334155">Heading: {Math.round(headingDeg)}°</text>
+        )}
+        {/* detections */}
+        {visibleDetections.map((d) => {
+          const angle = d.angleDeg ?? 0; // mono -> center
+          const radiusPct = d.distanceBand === "near" ? 0.5 : d.distanceBand === "mid" ? 0.75 : 1.0;
+          const { x, y } = toXY(angle, radiusPct);
+          const color = d.label === "voice" ? "#2563eb" : d.label === "footsteps" ? "#16a34a" : d.label === "animal_call" ? "#d97706" : d.label === "twig_snap" ? "#dc2626" : "#64748b";
+          const alpha = clamp((Date.now() - d.t) / 8000, 0, 1);
+          const op = 1 - alpha;
+          return (
+            <g key={d.id}>
+              <circle cx={x} cy={y} r={8} fill={color} fillOpacity={op} />
+              <text x={x} y={y - 12} fontSize={11} textAnchor="middle" fill="#1f2937" opacity={op}>{labelToText(d.label)}</text>
+            </g>
+          );
+        })}
+        {/* forward arrow */}
+        <polygon points={`${cx},${cy - R - 6} ${cx - 6},${cy - R + 8} ${cx + 6},${cy - R + 8}`} fill="#0f172a" />
+        <text x={cx} y={cy - R - 10} textAnchor="middle" fontSize={11} fill="#0f172a">Forward</text>
+      </svg>
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      <div className="max-w-3xl mx-auto p-4 sm:p-6">
+        <header className="mb-4">
+          <h1 className="text-2xl font-semibold tracking-tight">Acoustic Scout</h1>
+          <p className="text-sm text-slate-600">Point your phone forward. Listen for voices, footsteps, animal calls, twig snaps. Plot rough direction and type.</p>
+        </header>
+
+        <div className="flex flex-wrap items-center gap-3 mb-4">
+          {!running ? (
+            <button onClick={start} className="px-4 py-2 rounded-2xl bg-emerald-600 text-white shadow hover:bg-emerald-700">Start listening</button>
+          ) : (
+            <button onClick={stop} className="px-4 py-2 rounded-2xl bg-rose-600 text-white shadow hover:bg-rose-700">Stop</button>
+          )}
+
+          <button onClick={enableCompass} disabled={compassEnabled} className={`px-3 py-2 rounded-2xl shadow ${compassEnabled ? "bg-slate-300 text-slate-600" : "bg-indigo-600 text-white hover:bg-indigo-700"}`}>
+            {compassEnabled ? "Compass enabled" : "Enable compass"}
+          </button>
+
+          <span className={`text-xs px-2 py-1 rounded-full ${hasStereo ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"}`}>
+            {hasStereo ? "Stereo mics detected" : "Mono input (directional estimate limited)"}
+          </span>
+        </div>
+
+        {error && (
+          <div className="mb-4 p-3 rounded-xl bg-rose-50 text-rose-700 border border-rose-200">
+            <strong>Error:</strong> {error}
+          </div>
+        )}
+
+        <div className="rounded-2xl bg-white shadow p-4">
+          <ArcViz />
+          <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="p-3 rounded-xl bg-slate-100">
+              <h3 className="font-medium mb-2">Recent detections</h3>
+              <ul className="space-y-2 max-h-56 overflow-auto pr-1">
+                {visibleDetections.length === 0 && (
+                  <li className="text-sm text-slate-500">Listening... try speaking softly, walking in front, whistling, or snapping a twig.</li>
+                )}
+                {visibleDetections.slice().reverse().map((d) => (
+                  <li key={d.id} className="text-sm flex items-center justify-between gap-2">
+                    <span className="font-medium">{labelToText(d.label)}</span>
+                    <span className="text-slate-500">{d.angleDeg !== null ? `${d.angleDeg > 0 ? "Right" : d.angleDeg < 0 ? "Left" : "Center"} ${Math.abs(Math.round(d.angleDeg))}°` : "—"}</span>
+                    <span className="text-slate-500 capitalize">{d.distanceBand}</span>
+                    <span className="text-slate-700">{Math.round(d.confidence * 100)}%</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+
+            <div className="p-3 rounded-xl bg-slate-100">
+              <h3 className="font-medium mb-2">Tips</h3>
+              <ul className="text-sm list-disc pl-5 space-y-1 text-slate-700">
+                <li>Hold the phone steady, screen toward you, and point the camera toward the area of interest.</li>
+                <li>If stereo isn’t available, gently sway the phone left–right; direction cues improve with slight movement.</li>
+                <li>Short, sharp sounds (snaps, twig breaks) localize better than long booms in outdoor spaces.</li>
+                <li>Wind noise and heavy echo reduce reliability; cup the phone edges to shield mics from wind.</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <footer className="text-xs text-slate-500 mt-4 leading-relaxed">
+          <p>
+            Prototype – no guarantees. Direction is estimated from interaural time differences over a short window; angle and distance are approximate. Avoid using for safety-critical tasks.
+          </p>
+        </footer>
+      </div>
+    </div>
+  );
+}
